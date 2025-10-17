@@ -56,13 +56,6 @@ def ensure_valid_fps(fps: float) -> float:
     return 30.0
 
 
-def gaussian_kernel_for_size(width: int, height: int) -> Tuple[int, int]:
-    base = max(min(width, height) // 20, 25)
-    k = base if base % 2 == 1 else base + 1
-    k = max(25, min(k, 151))
-    return (k, k)
-
-
 def outpaint_frame(
     frame: np.ndarray,
     target_w: int,
@@ -102,8 +95,9 @@ def outpaint_frame(
 
     if mode == "blur":
         bg = cv2.resize(overlay, (target_w, target_h), interpolation=cv2.INTER_AREA)
-        kx, ky = gaussian_kernel_for_size(target_w, target_h)
-        bg = cv2.GaussianBlur(bg, (kx, ky), sigmaX=0, sigmaY=0)
+        # Use sigma-based Gaussian blur (no kernel helper). Sigma scales with image size.
+        sigma = max(target_w, target_h) * 0.02
+        bg = cv2.GaussianBlur(bg, (0, 0), sigmaX=sigma, sigmaY=sigma)
         bg[y : y + src_h, x : x + src_w] = overlay
         return bg
 
@@ -124,8 +118,8 @@ def build_init_and_mask(
 
     # Background context: resized + strong blur
     bg = cv2.resize(frame_bgr, (target_w, target_h), interpolation=cv2.INTER_AREA)
-    kx, ky = gaussian_kernel_for_size(target_w, target_h)
-    bg = cv2.GaussianBlur(bg, (kx, ky), sigmaX=0, sigmaY=0)
+    sigma = max(target_w, target_h) * 0.02
+    bg = cv2.GaussianBlur(bg, (0, 0), sigmaX=sigma, sigmaY=sigma)
 
     # Paste original frame at center (kept area)
     bg[y : y + src_h, x : x + src_w] = frame_bgr
