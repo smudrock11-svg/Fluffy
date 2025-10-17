@@ -24,8 +24,8 @@ export GOOGLE_API_KEY=YOUR_KEY_HERE
 ### Local outpainting (no APIs)
 - Expands canvas to `--width` x `--height`:
   - Simple modes: `blur` (default), `mirror`, `replicate`, `solid`
-  - AI mode: `ai` uses LaMa inpainting to synthesize new content in the padded regions
-- Works entirely offline (no external APIs). AI mode uses local PyTorch.
+  - AI mode: `ai` uses MMagic (DeepFillv2) inpainting to synthesize new content in the padded regions
+- Works entirely offline (no external APIs). AI mode uses local PyTorch + MMagic.
 
 ```bash
 # Example: outpaint to 1080x1920 with blurred background
@@ -60,7 +60,7 @@ python local_outpaint.py \
   --scale-to-fit \
   --out ./outpainted_scaled.mp4
 
-# AI mode (LaMa) to synthesize new borders
+# AI mode (MMagic DeepFillv2) to synthesize new borders
 python local_outpaint.py \
   --input ./input.mp4 \
   --width 1080 \
@@ -75,7 +75,7 @@ Notes:
 - For `--mode solid`, color can be `#RRGGBB` or `R,G,B`.
 - For AI mode, install dependencies:
   ```bash
-  pip install torch torchvision Pillow simple-lama-inpainting
+  pip install torch torchvision Pillow mmengine mmcv mmagic
   ```
   GPU is recommended but not required.
 

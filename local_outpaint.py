@@ -7,7 +7,7 @@ from typing import Tuple, Optional
 import cv2
 import numpy as np
 
-# NOTE: AI mode dependencies (torch, PIL, simple-lama-inpainting) are imported lazily only when used
+# NOTE: AI mode dependencies (mmagic/mmedit, mmcv, mmengine, PIL, torch) are imported lazily only when used
 
 
 def die(message: str, code: int = 1) -> None:
@@ -143,33 +143,74 @@ def build_init_and_mask(
     mask_image = Image.fromarray(mask, mode="L")
     return init_image, mask_image
 
-def load_lama_model(device_pref: str):
-    """Load Simple LaMa inpainting model for AI mode."""
+def load_mmagic_inpainter(
+    device_pref: str,
+    config_path: Optional[str] = None,
+    checkpoint_path: Optional[str] = None,
+):
+    """Load MMEditing/MMagic DeepFillv2 inpainter for AI mode.
+
+    Downloads default config/checkpoint if not provided.
+    """
     try:
-        # Try to import torch to resolve 'auto' device
         import torch  # type: ignore
     except Exception:
         torch = None  # type: ignore
 
+    # Lazy imports
     try:
-        from simple_lama_inpainting import SimpleLama  # type: ignore
+        from mmagic.apis import init_model, inpainting_inference  # type: ignore
     except Exception:
-        die(
-            "AI mode requires 'simple-lama-inpainting'. Install: pip install torch torchvision pillow simple-lama-inpainting"
+        try:
+            # Legacy package name fallback
+            from mmedit.apis import init_model, inpainting_inference  # type: ignore
+        except Exception:
+            die(
+                "AI mode requires 'mmagic' (or 'mmedit') with mmcv/mmengine.\n"
+                "Install: pip install mmagic mmcv mmengine Pillow torch torchvision"
+            )
+
+    if device_pref == "auto":
+        device = "cuda" if (torch is not None and getattr(torch, "cuda").is_available()) else "cpu"
+    else:
+        device = device_pref
+
+    # Defaults for DeepFillv2
+    if not config_path:
+        config_path = (
+            "https://raw.githubusercontent.com/open-mmlab/mmagic/main/configs/inpainting/deepfillv2/"
+            "deepfillv2_256x256_8xb8_places.py"
+        )
+    if not checkpoint_path:
+        checkpoint_path = (
+            "https://download.openmmlab.com/mmediting/inpainting/deepfillv2/"
+            "deepfillv2_256x256_8xb8_places_20200619-16250d4f.pth"
         )
 
-    device = device_pref
-    if device == "auto":
-        if torch is not None:
-            device = "cuda" if getattr(torch, "cuda").is_available() else "cpu"
-        else:
-            device = "cpu"
-
     try:
-        model = SimpleLama(device=device)
+        model = init_model(config_path, checkpoint_path, device=device)
     except Exception as e:
-        die(f"Failed to initialize SimpleLama model on device='{device}': {e}")
-    return model
+        die(
+            "Failed to initialize MMagic inpainting model. Ensure mmagic/mmcv/mmengine versions are compatible.\n"
+            f"Details: {e}"
+        )
+
+    def infer(img_rgb: np.ndarray, mask_gray: np.ndarray) -> np.ndarray:
+        # mmagic typically expects BGR image; convert
+        img_bgr = img_rgb[:, :, ::-1]
+        # mask expected uint8 with 255 indicating holes
+        result_bgr = inpainting_inference(model, img_bgr, mask_gray)
+        # Some versions return dict or ndarray
+        if isinstance(result_bgr, dict):
+            # common key names
+            if "pred_img" in result_bgr:
+                result_bgr = result_bgr["pred_img"]
+            elif "output" in result_bgr:
+                result_bgr = result_bgr["output"]
+        result_rgb = result_bgr[:, :, ::-1]
+        return result_rgb
+
+    return infer
 
 
 def main() -> None:
@@ -208,13 +249,15 @@ def main() -> None:
         ),
     )
 
-    # AI mode options (LaMa)
+    # AI mode options (MMagic DeepFillv2)
     parser.add_argument(
         "--device",
         choices=["auto", "cuda", "cpu"],
         default="auto",
-        help="Device for AI mode (LaMa)",
+        help="Device for AI mode (MMagic)",
     )
+    parser.add_argument("--ai-config", default=None, help="Override MMagic config URL/path (mode=ai)")
+    parser.add_argument("--ai-checkpoint", default=None, help="Override checkpoint URL/path (mode=ai)")
 
     args = parser.parse_args()
 
@@ -257,10 +300,14 @@ def main() -> None:
     processed = 0
 
     # Prepare AI model only if needed
-    lama_model = None
+    mmagic_infer = None
     if args.mode == "ai":
         try:
-            lama_model = load_lama_model(device_pref=args.device)
+            mmagic_infer = load_mmagic_inpainter(
+                device_pref=args.device,
+                config_path=args.ai_config,
+                checkpoint_path=args.ai_checkpoint,
+            )
         except Exception as e:
             cap.release()
             writer.release()
@@ -275,19 +322,21 @@ def main() -> None:
                 frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
 
             if args.mode == "ai":
-                # Build init and mask, then run LaMa inpainting
+                # Build init and mask, then run MMagic inpainting (DeepFillv2)
                 init_image, mask_image = build_init_and_mask(
                     frame_bgr=frame,
                     target_w=target_w,
                     target_h=target_h,
                 )
                 try:
-                    result_image = lama_model(init_image, mask_image)
+                    init_np = np.array(init_image)  # RGB
+                    mask_np = np.array(mask_image)  # L (0/255)
+                    result_rgb = mmagic_infer(init_np, mask_np)
                 except Exception as e:
                     cap.release()
                     writer.release()
-                    die(f"LaMa inference failed: {e}")
-                result = cv2.cvtColor(np.array(result_image), cv2.COLOR_RGB2BGR)
+                    die(f"MMagic inpainting failed: {e}")
+                result = cv2.cvtColor(result_rgb, cv2.COLOR_RGB2BGR)
             else:
                 result = outpaint_frame(
                     frame=frame,
