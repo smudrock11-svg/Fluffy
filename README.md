@@ -22,7 +22,7 @@ export GOOGLE_API_KEY=YOUR_KEY_HERE
 ```
 
 ### Local outpainting (no APIs)
-- Expands canvas to `--width` x `--height`:
+- Expands canvas to `--width` x `--height` (width optional):
   - Simple modes: `blur` (default), `mirror`, `replicate`, `solid`
   - AI mode: `ai` uses MMagic (DeepFillv2) inpainting to synthesize new content in the padded regions
 - Works entirely offline (no external APIs). AI mode uses local PyTorch + MMagic.
@@ -68,6 +68,15 @@ python local_outpaint.py \
   --mode ai \
   --device auto \
   --out ./outpainted_ai.mp4
+```
+
+Height-only outpainting (keep source width unchanged):
+
+```bash
+python local_outpaint.py \
+  --input ./input.mp4 \
+  --height 1536 \
+  --out ./outpainted_height_only.mp4
 ```
 
 Notes:

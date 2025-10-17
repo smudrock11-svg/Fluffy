@@ -4,7 +4,6 @@ import sys
 from pathlib import Path
 from typing import Tuple, Optional
 
-import cv2
 import numpy as np
 
 # NOTE: AI mode dependencies (mmagic/mmedit, mmcv, mmengine, PIL, torch) are imported lazily only when used
@@ -71,6 +70,7 @@ def outpaint_frame(
     color_bgr: Tuple[int, int, int],
     scale_to_fit: bool,
 ) -> np.ndarray:
+    import cv2
     src_h, src_w = frame.shape[:2]
 
     overlay = frame
@@ -116,6 +116,7 @@ def build_init_and_mask(
     target_w: int,
     target_h: int,
 ) -> Tuple["Image.Image", "Image.Image"]:
+    import cv2
     # Lazy import PIL
     from PIL import Image
 
@@ -222,7 +223,12 @@ def main() -> None:
     )
     parser.add_argument("--input", required=True, help="Path to input video file")
     parser.add_argument("--out", required=True, help="Path to output video file (.mp4 recommended)")
-    parser.add_argument("--width", type=int, required=True, help="Target output width in pixels")
+    parser.add_argument(
+        "--width",
+        type=int,
+        default=None,
+        help="Target output width in pixels (default: source width)",
+    )
     parser.add_argument("--height", type=int, required=True, help="Target output height in pixels")
     parser.add_argument(
         "--mode",
@@ -260,6 +266,7 @@ def main() -> None:
     parser.add_argument("--ai-checkpoint", default=None, help="Override checkpoint URL/path (mode=ai)")
 
     args = parser.parse_args()
+    import cv2
 
     in_path = Path(args.input).expanduser().resolve()
     if not in_path.exists():
@@ -268,12 +275,9 @@ def main() -> None:
     out_path = Path(args.out).expanduser().resolve()
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
-    target_w = int(args.width)
     target_h = int(args.height)
-    if target_w <= 0 or target_h <= 0:
-        die("--width and --height must be positive integers")
-
-    color_bgr = parse_rgb_color(args.color)
+    if target_h <= 0:
+        die("--height must be a positive integer")
 
     cap = cv2.VideoCapture(str(in_path))
     if not cap.isOpened():
@@ -282,6 +286,13 @@ def main() -> None:
     src_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     src_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     src_fps = cap.get(cv2.CAP_PROP_FPS)
+
+    # Resolve target width now that we know the source size
+    target_w = int(args.width) if args.width is not None else src_w
+    if target_w <= 0:
+        die("--width must be a positive integer when specified")
+
+    color_bgr = parse_rgb_color(args.color)
 
     if not args.scale_to_fit and (src_w > target_w or src_h > target_h):
         die(
