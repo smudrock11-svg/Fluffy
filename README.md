@@ -22,8 +22,10 @@ export GOOGLE_API_KEY=YOUR_KEY_HERE
 ```
 
 ### Local outpainting (no APIs)
-- Expands canvas to `--width` x `--height` with various background modes: `blur` (default), `mirror`, `replicate`, or `solid`.
-- Works entirely offline using OpenCV.
+- Expands canvas to `--width` x `--height`:
+  - Simple modes: `blur` (default), `mirror`, `replicate`, `solid`
+  - AI mode: `ai` uses LaMa inpainting to synthesize new content in the padded regions
+- Works entirely offline (no external APIs). AI mode uses local PyTorch.
 
 ```bash
 # Example: outpaint to 1080x1920 with blurred background
@@ -57,11 +59,25 @@ python local_outpaint.py \
   --height 1920 \
   --scale-to-fit \
   --out ./outpainted_scaled.mp4
+
+# AI mode (LaMa) to synthesize new borders
+python local_outpaint.py \
+  --input ./input.mp4 \
+  --width 1080 \
+  --height 1920 \
+  --mode ai \
+  --device auto \
+  --out ./outpainted_ai.mp4
 ```
 
 Notes:
 - Output FPS defaults to the source FPS (or 30 if unavailable). Override via `--fps`.
 - For `--mode solid`, color can be `#RRGGBB` or `R,G,B`.
+- For AI mode, install dependencies:
+  ```bash
+  pip install torch torchvision Pillow simple-lama-inpainting
+  ```
+  GPU is recommended but not required.
 
 ### Veo-3.0 video outpainting (Google AI)
 - The tool uploads your input video, requests outpainting to the given height (and optional width), and writes the result to the output path.

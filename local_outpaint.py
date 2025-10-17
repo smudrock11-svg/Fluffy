@@ -7,7 +7,7 @@ from typing import Tuple, Optional
 import cv2
 import numpy as np
 
-# NOTE: AI mode dependencies (torch, diffusers, PIL) are imported lazily only when used
+# NOTE: AI mode dependencies (torch, PIL, simple-lama-inpainting) are imported lazily only when used
 
 
 def die(message: str, code: int = 1) -> None:
@@ -143,47 +143,33 @@ def build_init_and_mask(
     mask_image = Image.fromarray(mask, mode="L")
     return init_image, mask_image
 
-
-def load_ai_pipeline(
-    model_id: str,
-    device_pref: str,
-    use_fp16: bool,
-    seed: Optional[int],
-):
-    # Lazy imports for AI mode
-    import torch
-    from diffusers import AutoPipelineForInpainting
-
-    if device_pref == "auto":
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-    else:
-        device = device_pref
-
-    dtype = torch.float16 if (device == "cuda" and use_fp16) else torch.float32
-
-    pipe = AutoPipelineForInpainting.from_pretrained(
-        model_id,
-        torch_dtype=dtype,
-    )
-    pipe = pipe.to(device)
+def load_lama_model(device_pref: str):
+    """Load Simple LaMa inpainting model for AI mode."""
     try:
-        pipe.enable_attention_slicing()
-        pipe.enable_vae_slicing()
+        # Try to import torch to resolve 'auto' device
+        import torch  # type: ignore
     except Exception:
-        pass
+        torch = None  # type: ignore
 
-    # Disable safety checker if available
     try:
-        if hasattr(pipe, "safety_checker"):
-            pipe.safety_checker = lambda images, clip_input: (images, [False] * len(images))
+        from simple_lama_inpainting import SimpleLama  # type: ignore
     except Exception:
-        pass
+        die(
+            "AI mode requires 'simple-lama-inpainting'. Install: pip install torch torchvision pillow simple-lama-inpainting"
+        )
 
-    generator = None
-    if seed is not None:
-        generator = torch.Generator(device=device).manual_seed(int(seed))
+    device = device_pref
+    if device == "auto":
+        if torch is not None:
+            device = "cuda" if getattr(torch, "cuda").is_available() else "cpu"
+        else:
+            device = "cpu"
 
-    return pipe, generator, device
+    try:
+        model = SimpleLama(device=device)
+    except Exception as e:
+        die(f"Failed to initialize SimpleLama model on device='{device}': {e}")
+    return model
 
 
 def main() -> None:
@@ -222,28 +208,13 @@ def main() -> None:
         ),
     )
 
-    # AI mode options
-    parser.add_argument("--prompt", default="", help="Prompt guiding AI outpainting (mode=ai)")
-    parser.add_argument(
-        "--negative-prompt",
-        default="low quality, blurry, distorted, deformed, artifacts, watermark, text",
-        help="Negative prompt to avoid artifacts (mode=ai)",
-    )
-    parser.add_argument(
-        "--model",
-        default="runwayml/stable-diffusion-inpainting",
-        help="Hugging Face model id for inpainting (mode=ai)",
-    )
-    parser.add_argument("--steps", type=int, default=25, help="Diffusion steps (mode=ai)")
-    parser.add_argument("--guidance", type=float, default=7.5, help="Guidance scale (mode=ai)")
-    parser.add_argument("--seed", type=int, default=None, help="Random seed (mode=ai)")
+    # AI mode options (LaMa)
     parser.add_argument(
         "--device",
         choices=["auto", "cuda", "cpu"],
         default="auto",
-        help="Device to run AI on (mode=ai)",
+        help="Device for AI mode (LaMa)",
     )
-    parser.add_argument("--fp16", action="store_true", help="Use float16 on CUDA (mode=ai)")
 
     args = parser.parse_args()
 
@@ -285,21 +256,15 @@ def main() -> None:
     frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     processed = 0
 
-    # Prepare AI pipeline only if needed
-    pipe = None
-    generator = None
+    # Prepare AI model only if needed
+    lama_model = None
     if args.mode == "ai":
         try:
-            pipe, generator, _device = load_ai_pipeline(
-                model_id=args.model,
-                device_pref=args.device,
-                use_fp16=bool(args.fp16),
-                seed=args.seed,
-            )
+            lama_model = load_lama_model(device_pref=args.device)
         except Exception as e:
             cap.release()
             writer.release()
-            die(f"Failed to initialize AI pipeline: {e}")
+            die(str(e))
 
     try:
         while True:
@@ -310,22 +275,18 @@ def main() -> None:
                 frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
 
             if args.mode == "ai":
-                # Build init and mask, then run the inpainting pipeline
+                # Build init and mask, then run LaMa inpainting
                 init_image, mask_image = build_init_and_mask(
                     frame_bgr=frame,
                     target_w=target_w,
                     target_h=target_h,
                 )
-                # Lazy import torch dtype types (ensures everything loaded)
-                result_image = pipe(
-                    prompt=args.prompt,
-                    negative_prompt=args.negative_prompt,
-                    image=init_image,
-                    mask_image=mask_image,
-                    num_inference_steps=int(args.steps),
-                    guidance_scale=float(args.guidance),
-                    generator=generator,
-                ).images[0]
+                try:
+                    result_image = lama_model(init_image, mask_image)
+                except Exception as e:
+                    cap.release()
+                    writer.release()
+                    die(f"LaMa inference failed: {e}")
                 result = cv2.cvtColor(np.array(result_image), cv2.COLOR_RGB2BGR)
             else:
                 result = outpaint_frame(
