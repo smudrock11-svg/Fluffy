@@ -2,10 +2,12 @@
 import argparse
 import sys
 from pathlib import Path
-from typing import Tuple
+from typing import Tuple, Optional
 
 import cv2
 import numpy as np
+
+# NOTE: AI mode dependencies (torch, diffusers, PIL) are imported lazily only when used
 
 
 def die(message: str, code: int = 1) -> None:
@@ -109,11 +111,86 @@ def outpaint_frame(
     return frame
 
 
+def build_init_and_mask(
+    frame_bgr: np.ndarray,
+    target_w: int,
+    target_h: int,
+) -> Tuple["Image.Image", "Image.Image"]:
+    # Lazy import PIL
+    from PIL import Image
+
+    src_h, src_w = frame_bgr.shape[:2]
+    left, right, top, bottom, x, y = compute_center_padding(src_w, src_h, target_w, target_h)
+
+    # Background context: resized + strong blur
+    bg = cv2.resize(frame_bgr, (target_w, target_h), interpolation=cv2.INTER_AREA)
+    kx, ky = gaussian_kernel_for_size(target_w, target_h)
+    bg = cv2.GaussianBlur(bg, (kx, ky), sigmaX=0, sigmaY=0)
+
+    # Paste original frame at center (kept area)
+    bg[y : y + src_h, x : x + src_w] = frame_bgr
+
+    # Mask: white (255) where we want the model to paint; black (0) to preserve
+    mask = np.full((target_h, target_w), 255, dtype=np.uint8)
+    mask[y : y + src_h, x : x + src_w] = 0
+
+    # Feather mask edges slightly to reduce seams
+    feather = max(7, int(round(min(target_w, target_h) * 0.01)) | 1)
+    mask = cv2.GaussianBlur(mask, (feather, feather), 0)
+
+    init_rgb = cv2.cvtColor(bg, cv2.COLOR_BGR2RGB)
+    init_image = Image.fromarray(init_rgb)
+    mask_image = Image.fromarray(mask, mode="L")
+    return init_image, mask_image
+
+
+def load_ai_pipeline(
+    model_id: str,
+    device_pref: str,
+    use_fp16: bool,
+    seed: Optional[int],
+):
+    # Lazy imports for AI mode
+    import torch
+    from diffusers import AutoPipelineForInpainting
+
+    if device_pref == "auto":
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+    else:
+        device = device_pref
+
+    dtype = torch.float16 if (device == "cuda" and use_fp16) else torch.float32
+
+    pipe = AutoPipelineForInpainting.from_pretrained(
+        model_id,
+        torch_dtype=dtype,
+    )
+    pipe = pipe.to(device)
+    try:
+        pipe.enable_attention_slicing()
+        pipe.enable_vae_slicing()
+    except Exception:
+        pass
+
+    # Disable safety checker if available
+    try:
+        if hasattr(pipe, "safety_checker"):
+            pipe.safety_checker = lambda images, clip_input: (images, [False] * len(images))
+    except Exception:
+        pass
+
+    generator = None
+    if seed is not None:
+        generator = torch.Generator(device=device).manual_seed(int(seed))
+
+    return pipe, generator, device
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
             "Local video outpainting without external APIs: expand canvas to target width/height "
-            "using mirror/replicate/blur/solid background modes."
+            "using mirror/replicate/blur/solid backgrounds, or generate with AI inpainting."
         )
     )
     parser.add_argument("--input", required=True, help="Path to input video file")
@@ -122,9 +199,9 @@ def main() -> None:
     parser.add_argument("--height", type=int, required=True, help="Target output height in pixels")
     parser.add_argument(
         "--mode",
-        choices=["mirror", "replicate", "blur", "solid"],
+        choices=["mirror", "replicate", "blur", "solid", "ai"],
         default="blur",
-        help="Background fill mode for outpainted regions",
+        help="Outpainting mode: simple backgrounds or 'ai' to synthesize new content",
     )
     parser.add_argument(
         "--color",
@@ -144,6 +221,29 @@ def main() -> None:
             "If source is larger than target, scale source down to fit instead of erroring."
         ),
     )
+
+    # AI mode options
+    parser.add_argument("--prompt", default="", help="Prompt guiding AI outpainting (mode=ai)")
+    parser.add_argument(
+        "--negative-prompt",
+        default="low quality, blurry, distorted, deformed, artifacts, watermark, text",
+        help="Negative prompt to avoid artifacts (mode=ai)",
+    )
+    parser.add_argument(
+        "--model",
+        default="runwayml/stable-diffusion-inpainting",
+        help="Hugging Face model id for inpainting (mode=ai)",
+    )
+    parser.add_argument("--steps", type=int, default=25, help="Diffusion steps (mode=ai)")
+    parser.add_argument("--guidance", type=float, default=7.5, help="Guidance scale (mode=ai)")
+    parser.add_argument("--seed", type=int, default=None, help="Random seed (mode=ai)")
+    parser.add_argument(
+        "--device",
+        choices=["auto", "cuda", "cpu"],
+        default="auto",
+        help="Device to run AI on (mode=ai)",
+    )
+    parser.add_argument("--fp16", action="store_true", help="Use float16 on CUDA (mode=ai)")
 
     args = parser.parse_args()
 
@@ -185,6 +285,22 @@ def main() -> None:
     frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     processed = 0
 
+    # Prepare AI pipeline only if needed
+    pipe = None
+    generator = None
+    if args.mode == "ai":
+        try:
+            pipe, generator, _device = load_ai_pipeline(
+                model_id=args.model,
+                device_pref=args.device,
+                use_fp16=bool(args.fp16),
+                seed=args.seed,
+            )
+        except Exception as e:
+            cap.release()
+            writer.release()
+            die(f"Failed to initialize AI pipeline: {e}")
+
     try:
         while True:
             ok, frame = cap.read()
@@ -193,14 +309,33 @@ def main() -> None:
             if frame.ndim == 2:
                 frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
 
-            result = outpaint_frame(
-                frame=frame,
-                target_w=target_w,
-                target_h=target_h,
-                mode=args.mode,
-                color_bgr=color_bgr,
-                scale_to_fit=args.scale_to_fit,
-            )
+            if args.mode == "ai":
+                # Build init and mask, then run the inpainting pipeline
+                init_image, mask_image = build_init_and_mask(
+                    frame_bgr=frame,
+                    target_w=target_w,
+                    target_h=target_h,
+                )
+                # Lazy import torch dtype types (ensures everything loaded)
+                result_image = pipe(
+                    prompt=args.prompt,
+                    negative_prompt=args.negative_prompt,
+                    image=init_image,
+                    mask_image=mask_image,
+                    num_inference_steps=int(args.steps),
+                    guidance_scale=float(args.guidance),
+                    generator=generator,
+                ).images[0]
+                result = cv2.cvtColor(np.array(result_image), cv2.COLOR_RGB2BGR)
+            else:
+                result = outpaint_frame(
+                    frame=frame,
+                    target_w=target_w,
+                    target_h=target_h,
+                    mode=args.mode,
+                    color_bgr=color_bgr,
+                    scale_to_fit=args.scale_to_fit,
+                )
 
             if result.shape[1] != target_w or result.shape[0] != target_h:
                 result = cv2.resize(result, (target_w, target_h), interpolation=cv2.INTER_LINEAR)
